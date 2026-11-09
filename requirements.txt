@@ -1,3 +1,4 @@
-streamlit
-google-generativeai
+streamlit>=1.30
+pandas
 pillow
+google-generativeai
