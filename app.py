@@ -30,6 +30,7 @@ import json
 import math
 import re
 import time
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -376,6 +377,22 @@ SYMPTOMS = {
     "heartburn": ("🔥 속쓰림·소화불량", ["famotidine", "antacid"]),
 }
 PAIN_SYMPTOMS = {"pain_fever", "menstrual", "sore_throat"}
+
+# 구매처 정보: (구분, 안내). 구분 'both'=약국 + (일부 제품) 편의점 안전상비의약품, 'pharmacy'=약국
+# ※ 편의점 판매 품목(안전상비의약품)은 2012년 13개로 지정된 뒤 거의 변동이 없으나 확대 논의가 진행 중이므로,
+#    구매 전 제품 포장의 '안전상비의약품' 표시 또는 약사 확인이 필요합니다.
+AVAILABILITY = {
+    "apap": ("both", "타이레놀 등 일부 제품은 편의점(안전상비의약품)에서도 판매. 약국에서는 함량·제형 선택 폭이 넓음."),
+    "ibuprofen": ("pharmacy", "약국 구매 권장. 편의점 판매 품목은 극히 제한적이라 제품별 확인이 필요."),
+    "naproxen": ("pharmacy", "일반의약품·전문의약품 제품이 섞여 있어 약국에서 약사 확인 후 구매."),
+    "pseudoephedrine": ("pharmacy", "약국에서 약사 상담 후 구매(단일제 또는 종합감기약 형태)."),
+    "chlorpheniramine": ("pharmacy", "단일제보다 종합감기약·알레르기약에 포함된 경우가 많아 약국 상담 권장."),
+    "cetirizine": ("pharmacy", "알레르기·비염약은 편의점 판매 품목에 포함되지 않아 약국에서 구매."),
+    "dextromethorphan": ("pharmacy", "기침약·종합감기약에 포함. 제품마다 성분이 다르니 포장의 성분표 확인."),
+    "guaifenesin": ("pharmacy", "거담제는 약국에서 구매. 가래 기침이면 약사에게 증상을 설명하세요."),
+    "famotidine": ("pharmacy", "위산 억제제는 약국에서 구매(편의점 소화제와는 다른 계열)."),
+    "antacid": ("both", "일부 제산제·소화제는 편의점에서도 판매. 약국에서는 제품 선택 폭이 넓음."),
+}
 
 # 영양제 (슬롯: 하루 중 기본 복용 시점 = (기준, 시간 오프셋))
 SUPPS = {
@@ -1003,6 +1020,63 @@ def score_style(score: int):
     return "#d64545", "고위험 조합 · 전문가 상담 필수"
 
 
+def pharmacist_script(r: dict) -> str:
+    """약국에서 그대로 읽어줄 수 있는 '약사 상담 메모'를 프로파일에서 자동 생성."""
+    p, parts = r["profile"], []
+    parts.append(f"나이: 만 {p['age']}세 / 성별: {p['sex']}")
+    if p["pregnant"]:
+        parts.append("임신 중(또는 가능성 있음)")
+    if p["lactating"]:
+        parts.append("수유 중")
+    if p["conditions"]:
+        parts.append("기저질환: " + ", ".join(CONDITIONS[c] for c in p["conditions"]))
+    if "renal_mild" in r["flags"] or "renal_severe" in r["flags"]:
+        parts.append("신장 기능 저하")
+    if "hepatic_mild" in r["flags"] or "hepatic_severe" in r["flags"]:
+        parts.append("간 기능 이상")
+    if p["chronic_meds"]:
+        parts.append("복용 중인 약: " + ", ".join(CHRONIC_MEDS[c] for c in p["chronic_meds"]))
+    if p["current_otc"]:
+        parts.append("이미 복용 중인 OTC: " + ", ".join(DRUGS[c]["name"] for c in p["current_otc"]))
+    if p["supps"]:
+        parts.append("영양제: " + ", ".join(SUPPS[c]["name"] for c in p["supps"]))
+    allergy = [ALLERGIES[a] for a in p["allergies"]] + ([p["allergy_text"]] if p["allergy_text"] else [])
+    parts.append("알레르기: " + (", ".join(allergy) if allergy else "없음"))
+    want = ", ".join(DRUGS[i["id"]]["name"] for i in r["items"]) or "-"
+    parts.append(f"찾는 성분: {want}")
+    return "\n".join(parts)
+
+
+def render_buy_tab(r: dict):
+    """추천된 약을 어디서 구할 수 있는지: 구매처 안내 + 지도 바로가기 + 약사 상담 메모."""
+    if not r["items"]:
+        st.info("추천된 약이 없어 구매처 안내를 생략합니다. 의료진 진료를 먼저 받으세요.")
+        return
+    rows = []
+    for it in r["items"]:
+        d = DRUGS[it["id"]]
+        kind, desc = AVAILABILITY[it["id"]]
+        where = "🏥 약국 + 🏪 일부 편의점" if kind == "both" else "🏥 약국"
+        rows.append([f"{d['icon']} {d['name']}", d["brand"], f'<span class="badge badge-info">{where}</span>', desc])
+    html(html_table(["성분", "대표 제품", "구매처", "안내"], rows))
+    st.caption("※ 편의점 판매 가능 품목(안전상비의약품)은 제도상 제한되어 있고 변경될 수 있어요. 제품 포장 표시나 약사에게 확인하세요.")
+
+    st.markdown("##### 📍 내 주변 약국 찾기")
+    area = st.text_input("지역 (선택)", key="buy_area", placeholder="예: 수원시 영통구 (비워두면 현재 위치 기준)")
+    q = quote(f"{area.strip()} 약국".strip() if area else "약국")
+    c1, c2, c3 = st.columns(3)
+    c1.link_button("🗺️ 네이버 지도", f"https://map.naver.com/p/search/{q}")
+    c2.link_button("🗺️ 카카오맵", f"https://map.kakao.com/?q={q}")
+    c3.link_button("🗺️ 구글 지도", f"https://www.google.com/maps/search/?api=1&query={q}")
+    c4, c5 = st.columns(2)
+    c4.link_button("🌙 심야·휴일 약국 (응급의료포털)", "https://www.e-gen.or.kr")
+    c5.link_button("🔎 제품 정보 (의약품안전나라)", "https://nedrug.mfds.go.kr")
+
+    st.markdown("##### 💬 약사에게 이렇게 말해 보세요")
+    st.caption("아래 메모를 보여주거나 읽어 주면 약사가 내 상황에 맞는 제품·용량을 확인해 줍니다. (오른쪽 위 아이콘으로 복사)")
+    st.code(pharmacist_script(r), language=None)
+
+
 def render_result(r: dict):
     color, label = score_style(r["score"])
     c1, c2 = st.columns([1, 2])
@@ -1015,7 +1089,7 @@ def render_result(r: dict):
                          f'<div class="l">{ic} {SEV[key][0]} · {SEV[key][1]}</div></div>', unsafe_allow_html=True)
         st.info(rule_summary(r))
 
-    tabs = st.tabs(["💊 추천 약물", "⚠️ DUR 상세", "🥗 영양제·음식", "🧠 PK/PD", "🤖 쉬운 설명"])
+    tabs = st.tabs(["💊 추천 약물", "🛒 구매처", "⚠️ DUR 상세", "🥗 영양제·음식", "🧠 PK/PD", "🤖 쉬운 설명"])
 
     with tabs[0]:
         if not r["items"]:
@@ -1039,6 +1113,9 @@ def render_result(r: dict):
                     html(finding_html(f, DRUGS[e["id"]]["name"]))
 
     with tabs[1]:
+        render_buy_tab(r)
+
+    with tabs[2]:
         for it in r["items"]:
             fs = [f for f in it["findings"] if f["cat"] != "음식"]
             if fs:
@@ -1052,7 +1129,7 @@ def render_result(r: dict):
             html(finding_html(dict(sev=x["sev"], cat="약물-약물", text=x["text"]),
                               f"{item_name(x['pair'][0])} + {item_name(x['pair'][1])}"))
 
-    with tabs[2]:
+    with tabs[3]:
         any_ = False
         for it in r["items"]:
             for f in [f for f in it["findings"] if f["cat"] == "음식"]:
@@ -1067,7 +1144,7 @@ def render_result(r: dict):
         if not any_:
             st.success("선택하신 음식·영양제와 관련된 특이 경고가 없습니다.")
 
-    with tabs[3]:
+    with tabs[4]:
         rows = []
         for it in r["items"]:
             d, pk = DRUGS[it["id"]], it["pk"]
@@ -1082,7 +1159,7 @@ def render_result(r: dict):
                 st.progress(min(1.0, pk["residual"]), text=f"다음 복용 직전 체내 잔존율 {pk['residual'] * 100:.0f}% (낮을수록 안전)")
             st.caption("잔존율 = 0.5^(간격/t½), 축적계수 R = 1/(1−잔존율). 교육용 1구획 모델이며 실제 용량 조절 기준이 아닙니다.")
 
-    with tabs[4]:
+    with tabs[5]:
         st.write(rule_summary(r))
         if st.button("🤖 Gemini로 쉬운 설명 생성", key="gem_sum"):
             with st.spinner("Gemini가 설명을 작성하는 중..."):
